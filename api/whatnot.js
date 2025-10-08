@@ -40,7 +40,9 @@ export default async function handler(req, res) {
     );
 
     // Seite laden und auf Netzwerk-Leerlauf warten
-    await page.goto(url, { waitUntil: "networkidle0", timeout: 45000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+await page.waitForSelector('#__NEXT_DATA__', { timeout: 10000 }).catch(()=>{});
+
 
     // 1) Next.js-Initialdaten lesen
     const nextData = await page.evaluate(() => {
