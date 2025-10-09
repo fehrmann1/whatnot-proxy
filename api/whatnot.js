@@ -1,6 +1,6 @@
 export const config = {
   runtime: "nodejs",          // <— statt "nodejs20"
-  regions: ["fra1", "iad1"]
+  regions: ["fra1"]
 };
 
 import chromium from "@sparticuz/chromium";
