@@ -35,6 +35,10 @@ browser = await puppeteer.launch({
 
     const page = await browser.newPage();
 
+    await page.setViewport({ width: 1280, height: 800 });
+await page.setExtraHTTPHeaders({ "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7" });
+
+
     // konservative Timeouts
     page.setDefaultNavigationTimeout(60000);
     page.setDefaultTimeout(30000);
@@ -45,6 +49,13 @@ browser = await puppeteer.launch({
 
     // Vorsichtiger laden: kein networkidle0 (kann in Serverless hängen)
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+// Warten, bis Shows-Karten da sind (oder still weiter nach 12s)
+await page.waitForSelector('a[href^="/live/"], a[href*="/live/"]', { timeout: 12000 }).catch(() => {});
+
+// (Optional) 1 Extra-Sekunde, damit Bilder/Alt-Texte geladen sind
+await page.waitForTimeout(1000);
+    
     await page.waitForSelector("#__NEXT_DATA__", { timeout: 10000 }).catch(() => {});
 
     // Versuche, Next.js-Initialdaten zu lesen
@@ -111,7 +122,8 @@ browser = await puppeteer.launch({
     if (!shows.length) {
       const domShows = await page.evaluate(() => {
         const out = [];
-        document.querySelectorAll('a[href^="/live/"]').forEach(a => {
+        document.querySelectorAll('a[href^="/live/"], a[href*="/live/"]')
+.forEach(a => {
           const href = a.getAttribute("href");
           if (!href) return;
           const url = new URL(href, location.origin).toString();
