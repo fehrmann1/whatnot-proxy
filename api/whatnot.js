@@ -1,16 +1,21 @@
 export const config = {
   runtime: "nodejs"
-  // regions: ["fra1"] // optional: nur eine Region im Hobby-Plan
+  // regions: ["fra1"] // optional: eine Region im Hobby-Plan
 };
 
 import chromium from "@sparticuz/chromium";
-import puppeteer from "puppeteer-core";
+import puppeteerCore from "puppeteer-core";
+import { addExtra } from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
+const puppeteer = addExtra(puppeteerCore);
+puppeteer.use(StealthPlugin());
+
+// kleines Sleep
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const now = () => Date.now();
-
-// wir geben uns selbst ~18–20 s, damit wir garantiert vor Vercels Timeout antworten
+// hartes internes Zeitbudget (damit kein 504)
 const BUDGET_MS = 20000;
+const now = () => Date.now();
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -42,7 +47,7 @@ export default async function handler(req, res) {
 
     const page = await browser.newPage();
 
-    // aggressiv Ressourcen sparen -> schneller
+    // unnötige Ressourcen blocken → schneller & weniger auffällig
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       const type = req.resourceType();
@@ -50,29 +55,31 @@ export default async function handler(req, res) {
       else req.continue();
     });
 
-    page.setDefaultNavigationTimeout( Math.min(60000, withinBudget()) );
-    page.setDefaultTimeout( Math.min(30000, Math.max(2000, withinBudget())) );
+    page.setDefaultNavigationTimeout(Math.min(60000, withinBudget()));
+    page.setDefaultTimeout(Math.min(30000, Math.max(2000, withinBudget())));
 
+    // realistische Header
     await page.setExtraHTTPHeaders({
       "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
       "Upgrade-Insecure-Requests": "1",
-      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-Site": "same-origin",
       "Sec-Fetch-Mode": "navigate",
       "Sec-Fetch-User": "?1",
       "Sec-Fetch-Dest": "document",
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     });
 
+    // UA + Stealth erledigt den Rest (navigator.webdriver, WebGL, etc.)
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
     );
 
-    // Laden
+    // Seite laden
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: Math.max(2000, withinBudget()) });
 
     const isInterstitialTitle = (t) => /nur einen moment|just a moment/i.test(t || "");
 
-    // max. 1 kurzer Reload-Versuch – keine langen Loops
+    // kurz warten, ob Interstitial verschwindet; ein Reload-Versuch
     for (let attempt = 0; attempt < 2 && withinBudget() > 0; attempt++) {
       let ok = false;
       const rounds = Math.min(8, Math.ceil(withinBudget() / 800));
@@ -83,24 +90,24 @@ export default async function handler(req, res) {
         if (withinBudget() <= 0) break;
       }
       if (ok) break;
-      // einmal reload, dann weiter
       await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
       await sleep(600);
     }
 
-    // kurzer Scroll → lazy load (trotz Blocken)
+    // kleiner Scroll → lazy load
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
     await sleep(300);
 
-    // auf Live-Links warten (kurz), ohne zu hängen
+    // kurz auf /live/-Links warten
     await page
-      .waitForSelector('a[href^="/live/"], a[href*="/live/"]', { timeout: Math.min(3000, Math.max(500, withinBudget())) })
+      .waitForSelector('a[href^="/live/"], a[href*="/live/"]', {
+        timeout: Math.min(3000, Math.max(500, withinBudget()))
+      })
       .catch(() => {});
 
-    // mini network idle (max 2s)
     try { await page.waitForNetworkIdle({ idleTime: 500, timeout: Math.min(2000, withinBudget()) }); } catch {}
 
-    // Debug
+    // Debug (in Vercel Logs)
     const info = await page.evaluate(() => ({
       title: document.title,
       anchorCount: document.querySelectorAll('a[href^="/live/"], a[href*="/live/"]').length,
@@ -108,7 +115,7 @@ export default async function handler(req, res) {
     }));
     console.log("whatnot page info:", info);
 
-    // Versuch Next.js-Daten (sehr kurz)
+    // __NEXT_DATA__ optional (kurz)
     await page.waitForSelector("#__NEXT_DATA__", { timeout: Math.min(1500, withinBudget()) }).catch(() => {});
     const nextData = await page.evaluate(() => {
       try {
@@ -175,7 +182,6 @@ export default async function handler(req, res) {
       );
     }
 
-    // Fallback: DOM (sehr schnell, ohne Bilder)
     if (!shows.length && withinBudget() > 0) {
       const domShows = await page.evaluate(() => {
         const results = [];
