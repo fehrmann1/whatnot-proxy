@@ -1,13 +1,13 @@
-// Hobby-Plan: keine Multi-Region. Runtime = Node.js Functions
+// Node.js Serverless Function (Hobby-Plan: keine Multi-Region)
 export const config = {
   runtime: "nodejs"
-  // regions: ["fra1"] // optional: eine einzelne Region möglich
+  // regions: ["fra1"] // optional: eine einzelne Region wäre erlaubt
 };
 
 import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
 
-// kleine Sleep-Helferfunktion (statt page.waitForTimeout)
+// Ersatz für page.waitForTimeout (in neueren Puppeteer-Versionen nicht vorhanden)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export default async function handler(req, res) {
@@ -36,8 +36,6 @@ export default async function handler(req, res) {
     });
 
     const page = await browser.newPage();
-
-    // sinnvolle Defaults / Header
     page.setDefaultNavigationTimeout(60000);
     page.setDefaultTimeout(30000);
 
@@ -49,21 +47,36 @@ export default async function handler(req, res) {
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
     );
 
-    // vorsichtiges Laden (networkidle0 kann in Serverless hängen)
+    // Vorsichtiges Laden – networkidle0 kann in Serverless hängen
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-    // Warten bis Karten erscheinen (max 12 s, sonst einfach weiter)
+    // 1) Scroll triggert Lazy-Loading
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await sleep(800);
+
+    // 2) Auf (mögliche) Live-Links warten; wenn keine kommen, still weiter
     await page
       .waitForSelector('a[href^="/live/"], a[href*="/live/"]', { timeout: 12000 })
       .catch(() => {});
 
-    // kurze Pause, damit Alt-Texte/Images da sind
-    await sleep(1000);
+    // 3) Kurzer Netzwerk-Idle (falls verfügbar)
+    try {
+      await page.waitForNetworkIdle({ idleTime: 750, timeout: 8000 });
+    } catch (_) {}
 
-    // falls vorhanden, zusätzlich auf Next.js-Daten warten (ohne Fehler)
-    await page.waitForSelector("#__NEXT_DATA__", { timeout: 10000 }).catch(() => {});
+    // 4) Noch 0,5s für Bilder/Alt-Texte
+    await sleep(500);
 
-    // 1) Versuch: Next.js Initialdaten auslesen
+    // Debug-Infos in die Function-Logs
+    const info = await page.evaluate(() => ({
+      title: document.title,
+      anchorCount: document.querySelectorAll('a[href^="/live/"], a[href*="/live/"]').length,
+      hasNextData: !!document.querySelector("#__NEXT_DATA__")
+    }));
+    console.log("whatnot page info:", info);
+
+    // 5) (optional) Next.js Initialdaten lesen
+    await page.waitForSelector("#__NEXT_DATA__", { timeout: 5000 }).catch(() => {});
     const nextData = await page.evaluate(() => {
       try {
         const tag = document.querySelector("#__NEXT_DATA__");
@@ -73,7 +86,9 @@ export default async function handler(req, res) {
       } catch {}
       return null;
     });
+    console.log("has nextData:", !!nextData);
 
+    // --- Extraktion ---
     const shows = [];
 
     const walk = (o, cb) => {
@@ -89,6 +104,7 @@ export default async function handler(req, res) {
       keys.find((k) => o && typeof o[k] === "string" && o[k]) &&
       o[keys.find((k) => o && typeof o[k] === "string" && o[k])];
 
+    // 5a) Versuch über __NEXT_DATA__
     if (nextData) {
       const seen = new Set();
       walk(nextData, (k, v) => {
@@ -126,7 +142,7 @@ export default async function handler(req, res) {
       );
     }
 
-    // 2) Fallback: direkt aus dem DOM lesen
+    // 5b) Fallback: DOM scannen
     if (!shows.length) {
       const domShows = await page.evaluate(() => {
         const results = [];
@@ -158,10 +174,13 @@ export default async function handler(req, res) {
       shows.push(...domShows);
     }
 
+    console.log("extracted shows:", shows.length);
+
     try { await browser.close(); } catch {}
     return res.status(200).json({ user: username, shows: shows.slice(0, 12) });
   } catch (e) {
     try { if (browser) await browser.close(); } catch {}
+    console.error("whatnot error:", e);
     return res.status(500).json({ error: String(e) });
   }
 }
