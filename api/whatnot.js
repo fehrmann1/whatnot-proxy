@@ -1,4 +1,7 @@
-export const config = { runtime: "nodejs20", regions: ["fra1","iad1"] };
+export const config = {
+  runtime: "nodejs",          // <— statt "nodejs20"
+  regions: ["fra1", "iad1"]
+};
 
 import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
