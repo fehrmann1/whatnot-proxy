@@ -1,61 +1,50 @@
 // api/whatnot.js
-// Erweiterter Endpoint: Liste + optionale Detail-Anreicherung (ohne Puppeteer)
+// Liefert: title, url, image, start_at (ISO) – ohne Puppeteer
 
-export const config = {
-  runtime: "nodejs",
-};
+export const config = { runtime: "nodejs" };
 
-// ---------- Defaults / Tuning ----------
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36";
 
-// Globales Zeitbudget
-const TOTAL_BUDGET_MS = 15000;
-// Timeout pro Detailseite
-const DETAIL_TIMEOUT_MS = 3500;
-
-// Fallback-Defaults
 const DEFAULT_LIMIT = 8;
-const DEFAULT_CONCURRENCY = 4;
+const DETAIL_TIMEOUT_MS = 3500;    // pro Detailseite
+const TOTAL_BUDGET_MS  = 15000;    // gesamtes Zeitbudget
+const CONCURRENCY      = 4;        // parallele Detail-Requests
 
-// ---------- Utils ----------
-const now = () => Date.now();
-
-function toInt(v, fallback) {
+// ---------- kleine Helfer ----------
+const toInt = (v, d) => {
   const n = Number(v);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
-}
-
-function pick(obj, keys) {
-  if (!obj || typeof obj !== "object") return null;
-  for (const k of keys) {
-    if (typeof obj[k] === "string" && obj[k]) return obj[k];
-  }
-  return null;
-}
+  return Number.isFinite(n) && n > 0 ? n : d;
+};
+const toAbs = (url) =>
+  !url ? null : url.startsWith("http") ? url : `https://www.whatnot.com${url.startsWith("/") ? "" : "/"}${url}`;
 
 function walk(obj, cb) {
   if (!obj || typeof obj !== "object") return;
   for (const k of Object.keys(obj)) {
-    try {
-      cb(k, obj[k]);
-    } catch {}
+    try { cb(k, obj[k]); } catch {}
     walk(obj[k], cb);
   }
 }
+const pick = (o, keys) => (o && typeof o === "object" ? keys.find(k => typeof o[k] === "string" && o[k]) && o[keys.find(k => typeof o[k] === "string" && o[k])] : null);
 
-function extractBetween(re, text) {
-  const m = re.exec(text);
-  return m ? m[1] : null;
+function extractScriptJSON(html, id) {
+  const re = new RegExp(`<script[^>]*id=["']${id}["'][^>]*>([\\s\\S]*?)<\\/script>`, "i");
+  const m = re.exec(html);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); } catch { return null; }
 }
+const extractNextData = (html) => extractScriptJSON(html, "__NEXT_DATA__");
 
-function toAbs(url) {
-  if (!url) return null;
-  return url.startsWith("http")
-    ? url
-    : `https://www.whatnot.com${url.startsWith("/") ? "" : "/"}${url}`;
+function extractJSONLD(html) {
+  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  const out = [];
+  let m;
+  while ((m = re.exec(html))) {
+    try { out.push(JSON.parse(m[1])); } catch {}
+  }
+  return out;
 }
-
 function getMeta(html, name) {
   const re = new RegExp(
     `<meta[^>]+(?:property|name)=["']${name}["'][^>]*content=["']([^"']+)["'][^>]*>`,
@@ -64,294 +53,150 @@ function getMeta(html, name) {
   return re.exec(html)?.[1] || null;
 }
 
-function extractScriptJSON(html, idOrRe) {
-  const re =
-    idOrRe instanceof RegExp
-      ? idOrRe
-      : new RegExp(`<script[^>]*id=["']${idOrRe}["'][^>]*>([\\s\\S]*?)<\\/script>`, "i");
-  const m = re.exec(html);
-  if (!m) return null;
-  try {
-    return JSON.parse(m[1]);
-  } catch {
-    return null;
-  }
-}
-
-function extractNextData(html) {
-  return extractScriptJSON(html, "__NEXT_DATA__");
-}
-
-function extractJSONLD(html) {
-  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  const out = [];
-  let m;
-  while ((m = re.exec(html))) {
-    try {
-      out.push(JSON.parse(m[1]));
-    } catch {}
-  }
-  return out;
-}
-
-function parsePriceHints(text) {
-  if (!text) return { price_hint: null, currency: null };
-  // "Startet bei 1 €", "ab 3,50 EUR", etc.
-  const m =
-    /(?:ab|bei|from)?\s*([0-9]+(?:[.,][0-9]{1,2})?)\s*(€|eur)/i.exec(text);
-  if (!m) return { price_hint: null, currency: null };
-  const value = m[1].replace(",", ".");
-  return { price_hint: Number(value), currency: "EUR" };
-}
-
-function computeStatus(hasLiveFlag, startIso) {
-  if (hasLiveFlag) return "live";
-  if (startIso) {
-    const t = Date.parse(startIso);
-    if (Number.isFinite(t) && t > now()) return "upcoming";
-  }
-  return "unknown";
-}
-
-// ---------- Übersicht von Profilseite ----------
-function extractFromNextDataList(nextData) {
+// ---------- Shows aus Profilseite ----------
+function fromNextDataList(nextData) {
   const shows = [];
-  if (!nextData) return shows;
   const seen = new Set();
-
   walk(nextData, (_k, v) => {
     if (Array.isArray(v)) {
       for (const it of v) {
-        const raw = pick(it, ["url", "href", "permalink", "path", "slug"]);
-        const title = pick(it, ["title", "name"]);
-        const image = pick(it, [
-          "image",
-          "img",
-          "coverImage",
-          "cover_image_url",
-          "thumbnail",
-          "cover",
-        ]);
-        const start_at = pick(it, [
-          "startAt",
-          "start_at",
-          "startsAt",
-          "scheduled_start_time",
-          "scheduledStartAt",
-        ]);
+        const raw = pick(it, ["url", "href", "permalink", "path"]);
+        const url = toAbs(raw);
+        if (!url || !/https?:\/\/www\.whatnot\.com\/live\//i.test(url) || seen.has(url)) continue;
+        seen.add(url);
 
-        const fullUrl = toAbs(raw);
-        if (!fullUrl) continue;
+        const title = pick(it, ["title", "name"]) || null;
+        const image = pick(it, ["image", "coverImage", "cover_image_url", "thumbnail", "img", "ogImage"]) || null;
 
-        if (/https?:\/\/www\.whatnot\.com\/live\//i.test(fullUrl) && !seen.has(fullUrl)) {
-          seen.add(fullUrl);
-
-          const id =
-            extractBetween(/\/live\/([^/?#]+)/i, fullUrl) ||
-            extractBetween(/\/live\/(.+)$/i, fullUrl);
-
-          const priceInfo = parsePriceHints(title);
-
-          shows.push({
-            id: id || null,
-            title: title || null,
-            url: fullUrl,
-            image: image || null,
-            start_at_iso: start_at || null,
-            starts_in_ms: start_at ? (Date.parse(start_at) - now()) : null,
-            status: "unknown",
-            ...priceInfo,
-          });
-        }
+        shows.push({ title, url, image, start_at: null });
       }
     }
   });
-
   return shows;
 }
 
-function extractFromHTMLList(html) {
+function fromHTMLList(html) {
   const shows = [];
   const seen = new Set();
-
   const linkRe = /<a [^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   let m;
   while ((m = linkRe.exec(html))) {
-    const href = m[1];
-    const abs = toAbs(href);
-    if (!abs || !/https?:\/\/www\.whatnot\.com\/live\//i.test(abs)) continue;
+    const url = toAbs(m[1]);
+    if (!url || !/https?:\/\/www\.whatnot\.com\/live\//i.test(url) || seen.has(url)) continue;
+    seen.add(url);
 
-    if (seen.has(abs)) continue;
-    seen.add(abs);
+    const a = m[0];
+    const title =
+      /aria-label=["']([^"']+)["']/i.exec(a)?.[1]?.trim() ||
+      /alt=["']([^"']+)["']/i.exec(a)?.[1]?.trim() ||
+      a.replace(/<[^>]*>/g, "").trim() ||
+      null;
 
-    const aTag = m[0];
-    const aria = /aria-label=["']([^"']+)["']/i.exec(aTag)?.[1]?.trim() || null;
-    const alt = /alt=["']([^"']+)["']/i.exec(aTag)?.[1]?.trim() || null;
-    const text = aTag.replace(/<[^>]*>/g, "").trim() || null;
+    const img = /<img[^>]+src=["']([^"']+)["']/i.exec(a)?.[1] || null;
 
-    const id =
-      extractBetween(/\/live\/([^/?#]+)/i, abs) ||
-      extractBetween(/\/live\/(.+)$/i, abs);
-
-    const priceInfo = parsePriceHints(aria || alt || text);
-
-    shows.push({
-      id: id || null,
-      title: aria || alt || text || null,
-      url: abs,
-      image: null,
-      start_at_iso: null,
-      starts_in_ms: null,
-      status: "unknown",
-      ...priceInfo,
-    });
+    shows.push({ title, url, image: img, start_at: null });
   }
-
   return shows;
 }
 
-// ---------- Details je Show ----------
-function detailFromNextData(nextData) {
-  let title = null,
-    image = null,
-    start_at_iso = null,
-    isLive = false;
-
+// ---------- Startzeit aus Detailseite ----------
+function extractStartFromNextData(nextData) {
+  let iso = null, title = null, image = null;
   walk(nextData, (_k, v) => {
     if (v && typeof v === "object") {
-      if (!title) title = pick(v, ["title", "name", "showTitle"]);
-      if (!image)
-        image = pick(v, [
-          "image",
-          "img",
-          "coverImage",
-          "cover_image_url",
-          "thumbnail",
-          "cover",
-          "ogImage",
-        ]);
-      if (!start_at_iso)
-        start_at_iso = pick(v, [
-          "startAt",
-          "start_at",
-          "startsAt",
-          "scheduled_start_time",
-          "scheduledStartAt",
-          "startDate",
-        ]);
-      if (!isLive && typeof v.isLive === "boolean") isLive = v.isLive;
+      if (!iso)
+        iso = pick(v, ["startAt", "start_at", "startsAt", "scheduled_start_time", "scheduledStartAt", "startDate"]);
+      if (!title) title = pick(v, ["title", "name"]);
+      if (!image) image = pick(v, ["image", "coverImage", "cover_image_url", "thumbnail", "img", "ogImage"]);
     }
   });
-
-  return { title, image, start_at_iso, isLive };
+  return { iso, title, image };
 }
-
-function detailFromJSONLD(ldBlocks) {
-  for (const block of ldBlocks) {
-    const list = Array.isArray(block) ? block : [block];
-    for (const item of list) {
+function extractStartFromJSONLD(ld) {
+  for (const block of ld) {
+    const arr = Array.isArray(block) ? block : [block];
+    for (const item of arr) {
       const types = Array.isArray(item?.["@type"]) ? item["@type"] : [item?.["@type"]];
-      if (types?.includes("Event")) {
-        const title = item.name || null;
-        const start_at_iso = item.startDate || null;
-        const image = (Array.isArray(item.image) ? item.image[0] : item.image) || null;
-        return { title, image, start_at_iso, isLive: false };
+      if (types?.includes("Event") && item.startDate) {
+        return { iso: item.startDate, title: item.name || null, image: (Array.isArray(item.image) ? item.image[0] : item.image) || null };
       }
     }
   }
-  return { title: null, image: null, start_at_iso: null, isLive: false };
+  return { iso: null, title: null, image: null };
 }
-
-function detailFromMeta(html) {
+function extractStartFromMeta(html) {
   const title = getMeta(html, "og:title") || getMeta(html, "twitter:title") || null;
   const image = getMeta(html, "og:image") || getMeta(html, "twitter:image") || null;
-
   const ld = extractJSONLD(html);
-  const fromLD = detailFromJSONLD(ld);
-  return {
-    title: title || fromLD.title,
-    image: image || fromLD.image,
-    start_at_iso: fromLD.start_at_iso,
-    isLive: fromLD.isLive,
-  };
+  const fromLD = extractStartFromJSONLD(ld);
+  return { iso: fromLD.iso, title: title || fromLD.title, image: image || fromLD.image };
 }
 
-async function fetchWithTimeout(url, ms, abortParent) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), ms);
-
-  const onAbort = () => controller.abort();
-  abortParent?.addEventListener("abort", onAbort, { once: true });
-
+async function fetchWithTimeout(url, ms, parentSignal) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  const onAbort = () => ctrl.abort();
+  parentSignal?.addEventListener("abort", onAbort, { once: true });
   try {
     const res = await fetch(url, {
       headers: {
         "User-Agent": UA,
-        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Cache-Control": "no-cache",
+        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
       },
       redirect: "follow",
-      signal: controller.signal,
+      signal: ctrl.signal,
     });
     return res;
   } finally {
     clearTimeout(t);
-    abortParent?.removeEventListener("abort", onAbort);
+    parentSignal?.removeEventListener("abort", onAbort);
   }
 }
 
-async function enrichShow(show, parentAbort) {
+async function enrich(show, parentSignal) {
   try {
-    const r = await fetchWithTimeout(show.url, DETAIL_TIMEOUT_MS, parentAbort);
+    const r = await fetchWithTimeout(show.url, DETAIL_TIMEOUT_MS, parentSignal);
     const html = await r.text();
 
-    let d = { title: null, image: null, start_at_iso: null, isLive: false };
+    let iso = null, title = null, image = null;
 
     const next = extractNextData(html);
-    if (next) d = detailFromNextData(next);
-
-    if (!d.title || !d.image || !d.start_at_iso) {
-      const more = detailFromMeta(html);
-      d = {
-        title: d.title || more.title,
-        image: d.image || more.image,
-        start_at_iso: d.start_at_iso || more.start_at_iso,
-        isLive: d.isLive || more.isLive,
-      };
+    if (next) {
+      const d = extractStartFromNextData(next);
+      iso = d.iso || iso;
+      title = d.title || title;
+      image = d.image || image;
+    }
+    if (!iso || !image || !title) {
+      const d = extractStartFromMeta(html);
+      iso = d.iso || iso;
+      title = d.title || title;
+      image = d.image || image;
     }
 
-    const status = computeStatus(d.isLive, d.start_at_iso);
-    const priceInfo = parsePriceHints(d.title || show.title);
-
     return {
-      ...show,
-      title: d.title || show.title,
-      image: d.image || show.image,
-      start_at_iso: d.start_at_iso || show.start_at_iso,
-      starts_in_ms: d.start_at_iso ? (Date.parse(d.start_at_iso) - now()) : show.starts_in_ms,
-      status,
-      price_hint: priceInfo.price_hint ?? show.price_hint,
-      currency: priceInfo.currency ?? show.currency,
+      title: title || show.title || null,
+      url: show.url,
+      image: image || show.image || null,
+      start_at: iso || null,
     };
   } catch {
-    // Bei Fehlern die Rohversion zurückgeben
+    // im Fehlerfall ursprüngliche Show zurückgeben
     return show;
   }
 }
 
-async function enrichAll(shows, parentAbort, concurrency) {
+async function enrichAll(shows, parentSignal) {
   const out = [];
   let i = 0;
-
   async function worker() {
     while (i < shows.length) {
       const idx = i++;
-      out[idx] = await enrichShow(shows[idx], parentAbort);
+      out[idx] = await enrich(shows[idx], parentSignal);
     }
   }
-
-  const workers = Array.from({ length: Math.min(concurrency, shows.length) }, () => worker());
+  const workers = Array.from({ length: Math.min(CONCURRENCY, shows.length) }, () => worker());
   await Promise.all(workers);
   return out;
 }
@@ -362,8 +207,6 @@ export default async function handler(req, res) {
 
   const username = String(req.query.user || "skycard").trim();
   const limit = toInt(req.query.limit, DEFAULT_LIMIT);
-  const details = String(req.query.details ?? "1") !== "0";
-  const concurrency = toInt(req.query.concurrency, DEFAULT_CONCURRENCY);
 
   const profileUrl = `https://www.whatnot.com/user/${encodeURIComponent(username)}/shows`;
 
@@ -371,54 +214,35 @@ export default async function handler(req, res) {
   const kill = setTimeout(() => globalAbort.abort(), TOTAL_BUDGET_MS);
 
   try {
-    // 1) Profilseite
+    // Profilseite laden
     const pr = await fetch(profileUrl, {
-      headers: {
-        "User-Agent": UA,
-        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Cache-Control": "no-cache",
-      },
+      headers: { "User-Agent": UA, Accept: "text/html", "Accept-Language": "de-DE,de;q=0.9" },
       redirect: "follow",
       signal: globalAbort.signal,
     });
-
     const html = await pr.text();
 
-    // 2) Liste extrahieren
+    // Shows extrahieren
     let shows = [];
     const next = extractNextData(html);
-    if (next) shows = extractFromNextDataList(next);
-    if (!shows.length) shows = extractFromHTMLList(html);
+    if (next) shows = fromNextDataList(next);
+    if (!shows.length) shows = fromHTMLList(html);
 
-    // 3) limitieren
+    // limitieren
     shows = shows.slice(0, limit);
 
-    // 4) Details optional anreichern
-    let data = shows;
-    if (details && shows.length) {
-      data = await enrichAll(shows, globalAbort.signal, concurrency);
-    }
+    // Startzeiten aus Detailseiten holen
+    const data = await enrichAll(shows, globalAbort.signal);
 
-    // 5) sortiere: live zuerst, dann nach Startzeit
-    data.sort((a, b) => {
-      const rank = (s) => (s.status === "live" ? 0 : s.starts_in_ms != null && s.starts_in_ms > 0 ? 1 : 2);
-      const r = rank(a) - rank(b);
-      if (r !== 0) return r;
-      const ta = Number.isFinite(a.starts_in_ms) ? a.starts_in_ms : Infinity;
-      const tb = Number.isFinite(b.starts_in_ms) ? b.starts_in_ms : Infinity;
-      return ta - tb;
-    });
-
+    // nur die gewünschten 4 Felder liefern
     return res.status(200).json({
-      meta: {
-        fetched_at: new Date().toISOString(),
-        user: username,
-        requested: { limit, details, concurrency },
-        returned: data.length,
-      },
       user: username,
-      shows: data,
+      shows: data.map(({ title, url, image, start_at }) => ({
+        title: title || null,
+        url,
+        image: image || null,
+        start_at: start_at || null, // ISO-String wenn gefunden
+      })),
     });
   } catch (err) {
     return res.status(500).json({ error: String(err) });
