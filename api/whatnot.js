@@ -1,39 +1,16 @@
 // api/whatnot.js
 
 export const config = {
-  runtime: "nodejs",
-  // regions: ["fra1"], // optional: nur eine Region im Hobby-Plan
+  runtime: "nodejs", // Hobby-Plan: eine Region, z.B. "fra1" optional via vercel.json
 };
 
 import chromium from "@sparticuz/chromium";
-import puppeteerCore from "puppeteer-core";
-import { addExtra } from "puppeteer-extra";
-import StealthPlugin from "puppeteer-extra-plugin-stealth";
-
-// --- Puppeteer + Stealth vorbereiten (problematische Evasions deaktivieren) ---
-const puppeteer = addExtra(puppeteerCore);
-const stealth = StealthPlugin();
-
-// Sämtliche Evasions, die mit "chrome." beginnen, deaktivieren
-for (const name of Array.from(stealth.enabledEvasions.keys())) {
-  if (name.startsWith("chrome.")) {
-    stealth.enabledEvasions.delete(name);
-  }
-}
-
-// (Optional) weitere Evasions gezielt abschalten, falls nötig
-// stealth.enabledEvasions.delete("iframe.contentWindow");
-// stealth.enabledEvasions.delete("media.codecs");
-
-puppeteer.use(stealth);
-
-
-// ------------------------------------------------------------------------------
+import puppeteer from "puppeteer-core";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
 
-// Hartes internes Zeitbudget, damit wir verlässlich vor dem Vercel-Timeout antworten
+// 20s Budget -> muss unter Vercel-Timeout bleiben
 const BUDGET_MS = 20000;
 
 export default async function handler(req, res) {
@@ -66,7 +43,21 @@ export default async function handler(req, res) {
 
     const page = await browser.newPage();
 
-    // Aggressiv Ressourcen sparen → schneller, weniger auffällig
+    // *** kleine Anti-Bot-Spoofs (ersetzen Stealth in abgespeckter Form) ***
+    await page.evaluateOnNewDocument(() => {
+      // navigator.webdriver -> undefined
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+
+      // Plugins/Languages
+      Object.defineProperty(navigator, "languages", {
+        get: () => ["de-DE", "de", "en-US", "en"],
+      });
+      Object.defineProperty(navigator, "plugins", {
+        get: () => [1, 2, 3, 4, 5],
+      });
+    });
+
+    // Netzwerk schonen -> schneller, weniger auffällig
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       const type = req.resourceType();
@@ -77,7 +68,6 @@ export default async function handler(req, res) {
     page.setDefaultNavigationTimeout(Math.min(60000, withinBudget()));
     page.setDefaultTimeout(Math.min(30000, Math.max(2000, withinBudget())));
 
-    // Realistische Header
     await page.setExtraHTTPHeaders({
       "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
       "Upgrade-Insecure-Requests": "1",
@@ -85,16 +75,13 @@ export default async function handler(req, res) {
       "Sec-Fetch-Mode": "navigate",
       "Sec-Fetch-User": "?1",
       "Sec-Fetch-Dest": "document",
-      Accept:
-        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     });
 
-    // UA – Stealth kümmert sich um navigator.webdriver, WebGL, usw.
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
     );
 
-    // Initiales Laden
     await page.goto(url, {
       waitUntil: "domcontentloaded",
       timeout: Math.max(2000, withinBudget()),
@@ -103,7 +90,7 @@ export default async function handler(req, res) {
     const isInterstitialTitle = (t) =>
       /nur einen moment|just a moment/i.test(t || "");
 
-    // Interstitial nur kurz tolerieren (max. 1 Reload)
+    // ggf. 1x neu laden, falls Interstitial
     for (let attempt = 0; attempt < 2 && withinBudget() > 0; attempt++) {
       let ok = false;
       const rounds = Math.min(8, Math.ceil(withinBudget() / 800));
@@ -121,19 +108,17 @@ export default async function handler(req, res) {
       await sleep(600);
     }
 
-    // Kleines Scrollen → evtl. lazy-load antriggern
+    // leichte Interaktion -> lazy-load antriggern
     await page
       .evaluate(() => window.scrollTo(0, document.body.scrollHeight))
       .catch(() => {});
     await sleep(300);
 
-    // Kurz auf /live/-Links warten, ohne zu hängen
     await page
       .waitForSelector('a[href^="/live/"], a[href*="/live/"]', {
         timeout: Math.min(3000, Math.max(500, withinBudget())),
       })
       .catch(() => {});
-
     try {
       await page.waitForNetworkIdle({
         idleTime: 500,
@@ -141,7 +126,7 @@ export default async function handler(req, res) {
       });
     } catch {}
 
-    // Debug in Logs
+    // Debug
     const info = await page
       .evaluate(() => ({
         title: document.title,
@@ -153,7 +138,7 @@ export default async function handler(req, res) {
       .catch(() => ({ title: "", anchorCount: 0, hasNextData: false }));
     console.log("whatnot page info:", info);
 
-    // __NEXT_DATA__ optional (kurz) – wenn vorhanden, nutzen wir sie
+    // nextData optional, wenn vorhanden auswerten
     await page
       .waitForSelector("#__NEXT_DATA__", {
         timeout: Math.min(1500, withinBudget()),
@@ -187,7 +172,7 @@ export default async function handler(req, res) {
       keys.find((k) => o && typeof o[k] === "string" && o[k]) &&
       o[keys.find((k) => o && typeof o[k] === "string" && o[k])];
 
-    // 1) Extraktion aus Next.js JSON
+    // 1) Next.js JSON
     if (nextData && withinBudget() > 0) {
       const seen = new Set();
       walk(nextData, (k, v) => {
@@ -241,7 +226,7 @@ export default async function handler(req, res) {
       );
     }
 
-    // 2) Fallback: DOM-Anker parsen
+    // 2) DOM-Fallback
     if (!shows.length && withinBudget() > 0) {
       const domShows = await page
         .evaluate(() => {
