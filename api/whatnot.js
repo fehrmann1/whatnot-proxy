@@ -1,6 +1,7 @@
+// Hobby-Plan: eine Region oder ganz weglassen
 export const config = {
-  runtime: "nodejs",          // <— statt "nodejs20"
-  regions: ["fra1"]
+  runtime: "nodejs"
+  // regions: ["fra1"] // optional, nur eine Region erlaubt im Hobby-Plan
 };
 
 import chromium from "@sparticuz/chromium";
@@ -8,27 +9,49 @@ import puppeteer from "puppeteer-core";
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
+
   const username = (req.query.user || "skycard").trim();
   const url = `https://www.whatnot.com/user/${username}/shows`;
 
+  // Sparticuz-Empfehlungen
   chromium.setHeadlessMode(true);
   chromium.setGraphicsMode("basic");
 
   let browser;
   try {
     const executablePath = await chromium.executablePath();
+
+    // WICHTIG: zusätzliche Flags gegen Crashes in Lambda-Umgebungen
     browser = await puppeteer.launch({
-      args: [...chromium.args, "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+      args: [
+        ...chromium.args,
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--single-process",
+        "--no-zygote",
+        "--disable-gpu"
+      ],
       defaultViewport: chromium.defaultViewport,
       executablePath,
       headless: chromium.headless
     });
 
     const page = await browser.newPage();
-    await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36");
+
+    // konservative Timeouts
+    page.setDefaultNavigationTimeout(60000);
+    page.setDefaultTimeout(30000);
+
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+    );
+
+    // Vorsichtiger laden: kein networkidle0 (kann in Serverless hängen)
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
     await page.waitForSelector("#__NEXT_DATA__", { timeout: 10000 }).catch(() => {});
 
+    // Versuche, Next.js-Initialdaten zu lesen
     const nextData = await page.evaluate(() => {
       try {
         const tag = document.querySelector("#__NEXT_DATA__");
@@ -40,8 +63,17 @@ export default async function handler(req, res) {
     });
 
     const shows = [];
-    const walk = (o, cb) => { if (o && typeof o === "object") for (const k of Object.keys(o)) { cb(k, o[k]); walk(o[k], cb); } };
-    const pick = (o, keys) => keys.find(k => o && typeof o[k] === "string" && o[k]) && o[keys.find(k => o && typeof o[k] === "string" && o[k])];
+    const walk = (o, cb) => {
+      if (o && typeof o === "object") {
+        for (const k of Object.keys(o)) {
+          cb(k, o[k]);
+          walk(o[k], cb);
+        }
+      }
+    };
+    const pick = (o, keys) =>
+      keys.find(k => o && typeof o[k] === "string" && o[k]) &&
+      o[keys.find(k => o && typeof o[k] === "string" && o[k])];
 
     if (nextData) {
       const seen = new Set();
@@ -53,36 +85,55 @@ export default async function handler(req, res) {
             const image = pick(it, ["image","img","coverImage","cover_image_url","thumbnail","cover"]);
             const start_at = pick(it, ["startAt","start_at","startsAt","scheduled_start_time"]);
             let fullUrl = null;
-            if (typeof raw === "string") fullUrl = raw.startsWith("http") ? raw : `https://www.whatnot.com${raw.startsWith("/")?"":"/"}${raw}`;
-            if (fullUrl && /https?:\/\/www\.whatnot\.com\/live\//.test(fullUrl) && !seen.has(fullUrl)) {
-              seen.add(fullUrl);
-              shows.push({ title: title || "Whatnot Show", url: fullUrl, image: image || null, start_at: start_at || null });
+            if (typeof raw === "string") {
+              fullUrl = raw.startsWith("http")
+                ? raw
+                : `https://www.whatnot.com${raw.startsWith("/") ? "" : "/"}${raw}`;
+            }
+            if (fullUrl && /https?:\/\/www\.whatnot\.com\/live\//.test(fullUrl)) {
+              if (!seen.has(fullUrl)) {
+                seen.add(fullUrl);
+                shows.push({
+                  title: title || "Whatnot Show",
+                  url: fullUrl,
+                  image: image || null,
+                  start_at: start_at || null
+                });
+              }
             }
           }
         }
       });
-      shows.sort((a,b)=>(a.start_at?Date.parse(a.start_at):Infinity)-(b.start_at?Date.parse(b.start_at):Infinity));
+      shows.sort(
+        (a, b) =>
+          (a.start_at ? Date.parse(a.start_at) : Infinity) -
+          (b.start_at ? Date.parse(b.start_at) : Infinity)
+      );
     }
 
+    // Fallback: DOM-Kacheln
     if (!shows.length) {
       const domShows = await page.evaluate(() => {
         const out = [];
         document.querySelectorAll('a[href^="/live/"]').forEach(a => {
-          const url = new URL(a.getAttribute("href"), location.origin).toString();
+          const href = a.getAttribute("href");
+          if (!href) return;
+          const url = new URL(href, location.origin).toString();
           const img = a.querySelector("img");
           const title = (img?.alt) || a.getAttribute("aria-label") || "Whatnot Show";
           out.push({ title, url, image: img?.src || null, start_at: null });
         });
         const seen = new Set();
-        return out.filter(s => !seen.has(s.url) && seen.add(s.url)).slice(0,12);
+        return out.filter(s => !seen.has(s.url) && seen.add(s.url)).slice(0, 12);
       });
       shows.push(...domShows);
     }
 
-    await browser.close().catch(()=>{});
-    return res.status(200).json({ user: username, shows: shows.slice(0,12) });
+    try { await browser.close(); } catch {}
+    return res.status(200).json({ user: username, shows: shows.slice(0, 12) });
   } catch (e) {
-    if (browser) try { await browser.close(); } catch {}
+    // bei Crash wenigstens JSON liefern
+    try { if (browser) await browser.close(); } catch {}
     return res.status(500).json({ error: String(e) });
   }
 }
