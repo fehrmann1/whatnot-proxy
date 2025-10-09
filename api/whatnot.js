@@ -1,19 +1,25 @@
-// Node.js Serverless Function (Hobby-Plan: keine Multi-Region)
 export const config = {
   runtime: "nodejs"
-  // regions: ["fra1"] // optional: eine einzelne Region erlaubt
+  // regions: ["fra1"] // optional: nur eine Region im Hobby-Plan
 };
 
 import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const now = () => Date.now();
+
+// wir geben uns selbst ~18–20 s, damit wir garantiert vor Vercels Timeout antworten
+const BUDGET_MS = 20000;
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
 
   const username = (req.query.user || "skycard").trim();
   const url = `https://www.whatnot.com/user/${username}/shows`;
+
+  const deadline = now() + BUDGET_MS;
+  const withinBudget = () => Math.max(0, deadline - now());
 
   let browser;
   try {
@@ -35,10 +41,18 @@ export default async function handler(req, res) {
     });
 
     const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(60000);
-    page.setDefaultTimeout(30000);
 
-    // möglichst realistische Header
+    // aggressiv Ressourcen sparen -> schneller
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const type = req.resourceType();
+      if (["image", "media", "font", "stylesheet"].includes(type)) req.abort();
+      else req.continue();
+    });
+
+    page.setDefaultNavigationTimeout( Math.min(60000, withinBudget()) );
+    page.setDefaultTimeout( Math.min(30000, Math.max(2000, withinBudget())) );
+
     await page.setExtraHTTPHeaders({
       "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
       "Upgrade-Insecure-Requests": "1",
@@ -46,55 +60,47 @@ export default async function handler(req, res) {
       "Sec-Fetch-Mode": "navigate",
       "Sec-Fetch-User": "?1",
       "Sec-Fetch-Dest": "document",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     });
 
-    // „echter“ User-Agent
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
     );
 
-    // Seite laden
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    // Laden
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: Math.max(2000, withinBudget()) });
 
-    // --- Anti-Bot-Interstitital abwarten / überspringen ---
-    const isInterstitialTitle = (t) =>
-      /nur einen moment|just a moment/i.test(t || "");
+    const isInterstitialTitle = (t) => /nur einen moment|just a moment/i.test(t || "");
 
-    // bis zu 2 Versuche (erste Seite + 1 Reload)
-    for (let attempt = 0; attempt < 2; attempt++) {
-      // bis zu 12 s warten, bis der Titel NICHT mehr "Nur einen Moment…" ist
+    // max. 1 kurzer Reload-Versuch – keine langen Loops
+    for (let attempt = 0; attempt < 2 && withinBudget() > 0; attempt++) {
       let ok = false;
-      for (let i = 0; i < 12; i++) {
+      const rounds = Math.min(8, Math.ceil(withinBudget() / 800));
+      for (let i = 0; i < rounds; i++) {
         const title = await page.title().catch(() => "");
-        if (!isInterstitialTitle(title)) {
-          ok = true;
-          break;
-        }
-        await sleep(1000);
+        if (!isInterstitialTitle(title)) { ok = true; break; }
+        await sleep(800);
+        if (withinBudget() <= 0) break;
       }
       if (ok) break;
-
-      // wenn immer noch Interstitital → noch einmal neu laden
+      // einmal reload, dann weiter
       await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-      await sleep(1500);
+      await sleep(600);
     }
 
-    // leichter Scroll (lazy load)
+    // kurzer Scroll → lazy load (trotz Blocken)
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
-    await sleep(800);
+    await sleep(300);
 
-    // auf mögliche Live-Links warten (still weiter, wenn nicht)
+    // auf Live-Links warten (kurz), ohne zu hängen
     await page
-      .waitForSelector('a[href^="/live/"], a[href*="/live/"]', { timeout: 12000 })
+      .waitForSelector('a[href^="/live/"], a[href*="/live/"]', { timeout: Math.min(3000, Math.max(500, withinBudget())) })
       .catch(() => {});
 
-    // (falls möglich) kurzen Idle abwarten
-    try { await page.waitForNetworkIdle({ idleTime: 750, timeout: 8000 }); } catch {}
+    // mini network idle (max 2s)
+    try { await page.waitForNetworkIdle({ idleTime: 500, timeout: Math.min(2000, withinBudget()) }); } catch {}
 
-    await sleep(500);
-
-    // Debug-Infos loggen
+    // Debug
     const info = await page.evaluate(() => ({
       title: document.title,
       anchorCount: document.querySelectorAll('a[href^="/live/"], a[href*="/live/"]').length,
@@ -102,8 +108,8 @@ export default async function handler(req, res) {
     }));
     console.log("whatnot page info:", info);
 
-    // Next.js-Daten optional holen
-    await page.waitForSelector("#__NEXT_DATA__", { timeout: 5000 }).catch(() => {});
+    // Versuch Next.js-Daten (sehr kurz)
+    await page.waitForSelector("#__NEXT_DATA__", { timeout: Math.min(1500, withinBudget()) }).catch(() => {});
     const nextData = await page.evaluate(() => {
       try {
         const tag = document.querySelector("#__NEXT_DATA__");
@@ -115,7 +121,6 @@ export default async function handler(req, res) {
     });
     console.log("has nextData:", !!nextData);
 
-    // --- Extraktion ---
     const shows = [];
 
     const walk = (o, cb) => {
@@ -131,7 +136,7 @@ export default async function handler(req, res) {
       keys.find((k) => o && typeof o[k] === "string" && o[k]) &&
       o[keys.find((k) => o && typeof o[k] === "string" && o[k])];
 
-    if (nextData) {
+    if (nextData && withinBudget() > 0) {
       const seen = new Set();
       walk(nextData, (k, v) => {
         if (Array.isArray(v)) {
@@ -170,7 +175,8 @@ export default async function handler(req, res) {
       );
     }
 
-    if (!shows.length) {
+    // Fallback: DOM (sehr schnell, ohne Bilder)
+    if (!shows.length && withinBudget() > 0) {
       const domShows = await page.evaluate(() => {
         const results = [];
         const anchors = Array.from(
@@ -187,12 +193,7 @@ export default async function handler(req, res) {
           const text = a.textContent?.trim();
           const title = alt || aria || text || "Whatnot Show";
 
-          let image = img?.src || img?.getAttribute("data-src") || null;
-          if (!image && img?.srcset) {
-            image = img.srcset.split(",").map(s => s.trim().split(" ")[0])[0] || null;
-          }
-
-          results.push({ title, url, image, start_at: null });
+          results.push({ title, url, image: null, start_at: null });
         }
         const seen = new Set();
         return results.filter(s => !seen.has(s.url) && seen.add(s.url)).slice(0, 12);
