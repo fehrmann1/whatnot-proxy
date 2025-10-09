@@ -13,10 +13,6 @@ export default async function handler(req, res) {
   const username = (req.query.user || "skycard").trim();
   const url = `https://www.whatnot.com/user/${username}/shows`;
 
-  // Sparticuz-Empfehlungen
-  chromium.setHeadlessMode(true);
-  chromium.setGraphicsMode("basic");
-
   let browser;
   try {
     const executablePath = await chromium.executablePath();
