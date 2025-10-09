@@ -1,7 +1,8 @@
 // api/whatnot.js
 
+// Vercel: Node.js-Runtime (nicht Edge)
 export const config = {
-  runtime: "nodejs", // Hobby-Plan: eine Region, z.B. "fra1" optional via vercel.json
+  runtime: "nodejs",
 };
 
 import chromium from "@sparticuz/chromium";
@@ -10,40 +11,45 @@ import puppeteer from "puppeteer-core";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
 
-// 20s Budget -> muss unter Vercel-Timeout bleiben
+// Zeitbudget pro Request (muss unter deinem Vercel-Timeout bleiben)
 const BUDGET_MS = 20000;
 
 export default async function handler(req, res) {
+  // CORS freigeben, damit du es im Shop laden kannst
   res.setHeader("Access-Control-Allow-Origin", "*");
 
   const username = (req.query.user || "skycard").trim();
-  const url = `https://www.whatnot.com/user/${encodeURIComponent(username)}/shows`;
+  const url = `https://www.whatnot.com/user/${encodeURIComponent(
+    username
+  )}/shows`;
 
   const deadline = now() + BUDGET_MS;
   const withinBudget = () => Math.max(0, deadline - now());
 
   let browser;
   try {
+    // Chromium-Binärpfad von @sparticuz/chromium auflösen
     const executablePath = await chromium.executablePath();
 
+    // *** WICHTIG ***: Suchpfad für geteilte Bibliotheken ergänzen (libnspr4.so etc.)
+    process.env.LD_LIBRARY_PATH = [
+      chromium.libPath,
+      process.env.LD_LIBRARY_PATH || "",
+    ]
+      .filter(Boolean)
+      .join(":");
+
+    // Browser starten – möglichst nah an den Chromium-Defaults bleiben
     browser = await puppeteer.launch({
-      args: [
-        ...chromium.args,
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--single-process",
-        "--no-zygote",
-        "--disable-gpu",
-      ],
-      defaultViewport: { width: 1280, height: 800 },
+      args: chromium.args,
       executablePath,
-      headless: true,
+      headless: chromium.headless,
+      defaultViewport: chromium.defaultViewport,
     });
 
     const page = await browser.newPage();
 
-    // *** kleine Anti-Bot-Spoofs (ersetzen Stealth in abgespeckter Form) ***
+    // Leichte Spoofs als Ersatz für Stealth (kein zusätzliches Plugin nötig)
     await page.evaluateOnNewDocument(() => {
       // navigator.webdriver -> undefined
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
@@ -57,7 +63,7 @@ export default async function handler(req, res) {
       });
     });
 
-    // Netzwerk schonen -> schneller, weniger auffällig
+    // Netzwerk schonen -> schneller & stabiler
     await page.setRequestInterception(true);
     page.on("request", (req) => {
       const type = req.resourceType();
@@ -65,9 +71,11 @@ export default async function handler(req, res) {
       else req.continue();
     });
 
+    // Timeouts am noch verfügbaren Budget ausrichten
     page.setDefaultNavigationTimeout(Math.min(60000, withinBudget()));
     page.setDefaultTimeout(Math.min(30000, Math.max(2000, withinBudget())));
 
+    // HTTP-Header & UA
     await page.setExtraHTTPHeaders({
       "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
       "Upgrade-Insecure-Requests": "1",
@@ -75,13 +83,15 @@ export default async function handler(req, res) {
       "Sec-Fetch-Mode": "navigate",
       "Sec-Fetch-User": "?1",
       "Sec-Fetch-Dest": "document",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     });
 
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
     );
 
+    // Seite laden
     await page.goto(url, {
       waitUntil: "domcontentloaded",
       timeout: Math.max(2000, withinBudget()),
@@ -90,7 +100,7 @@ export default async function handler(req, res) {
     const isInterstitialTitle = (t) =>
       /nur einen moment|just a moment/i.test(t || "");
 
-    // ggf. 1x neu laden, falls Interstitial
+    // Falls „Nur einen Moment…“, 1x reload versuchen
     for (let attempt = 0; attempt < 2 && withinBudget() > 0; attempt++) {
       let ok = false;
       const rounds = Math.min(8, Math.ceil(withinBudget() / 800));
@@ -108,12 +118,13 @@ export default async function handler(req, res) {
       await sleep(600);
     }
 
-    // leichte Interaktion -> lazy-load antriggern
+    // Leichte Interaktion -> lazy-load antriggern
     await page
       .evaluate(() => window.scrollTo(0, document.body.scrollHeight))
       .catch(() => {});
     await sleep(300);
 
+    // Ein paar Anker/Netzwerkaktivität abwarten
     await page
       .waitForSelector('a[href^="/live/"], a[href*="/live/"]', {
         timeout: Math.min(3000, Math.max(500, withinBudget())),
@@ -126,7 +137,7 @@ export default async function handler(req, res) {
       });
     } catch {}
 
-    // Debug
+    // Debug-Infos
     const info = await page
       .evaluate(() => ({
         title: document.title,
@@ -138,7 +149,7 @@ export default async function handler(req, res) {
       .catch(() => ({ title: "", anchorCount: 0, hasNextData: false }));
     console.log("whatnot page info:", info);
 
-    // nextData optional, wenn vorhanden auswerten
+    // Versuch, Next.js-JSON zu lesen
     await page
       .waitForSelector("#__NEXT_DATA__", {
         timeout: Math.min(1500, withinBudget()),
@@ -159,6 +170,7 @@ export default async function handler(req, res) {
 
     const shows = [];
 
+    // Kleine Helfer zum Traversieren
     const walk = (o, cb) => {
       if (o && typeof o === "object") {
         for (const k of Object.keys(o)) {
@@ -172,7 +184,7 @@ export default async function handler(req, res) {
       keys.find((k) => o && typeof o[k] === "string" && o[k]) &&
       o[keys.find((k) => o && typeof o[k] === "string" && o[k])];
 
-    // 1) Next.js JSON
+    // 1) Next.js JSON (falls vorhanden)
     if (nextData && withinBudget() > 0) {
       const seen = new Set();
       walk(nextData, (k, v) => {
@@ -226,7 +238,7 @@ export default async function handler(req, res) {
       );
     }
 
-    // 2) DOM-Fallback
+    // 2) DOM-Fallback, falls NextData leer
     if (!shows.length && withinBudget() > 0) {
       const domShows = await page
         .evaluate(() => {
@@ -258,6 +270,7 @@ export default async function handler(req, res) {
 
     console.log("extracted shows:", shows.length);
 
+    // Browser sauber schließen
     try {
       await browser.close();
     } catch {}
