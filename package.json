@@ -1,0 +1,9 @@
+{
+  "name": "whatnot-proxy",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@sparticuz/chromium": "120.0.3",
+    "puppeteer-core": "22.4.1"
+  }
+}
