@@ -1,5 +1,0 @@
-{
-  "functions": {
-    "api/whatnot.js": { "memory": 1024, "maxDuration": 10 }
-  }
-}
