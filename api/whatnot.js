@@ -18,20 +18,20 @@ export default async function handler(req, res) {
     const executablePath = await chromium.executablePath();
 
     // WICHTIG: zusätzliche Flags gegen Crashes in Lambda-Umgebungen
-    browser = await puppeteer.launch({
-      args: [
-        ...chromium.args,
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--single-process",
-        "--no-zygote",
-        "--disable-gpu"
-      ],
-      defaultViewport: chromium.defaultViewport,
-      executablePath,
-      headless: chromium.headless
-    });
+browser = await puppeteer.launch({
+  args: [
+    ...chromium.args,
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--single-process",
+    "--no-zygote",
+    "--disable-gpu"
+  ],
+  defaultViewport: chromium.defaultViewport,
+  executablePath: await chromium.executablePath(),
+  headless: true               // <-- direkt hier setzen
+});
 
     const page = await browser.newPage();
 
