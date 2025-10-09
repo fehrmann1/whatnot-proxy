@@ -14,11 +14,19 @@ import StealthPlugin from "puppeteer-extra-plugin-stealth";
 const puppeteer = addExtra(puppeteerCore);
 const stealth = StealthPlugin();
 
-// Diese Evasions machen auf Vercel häufig Ärger (u.a. lädt 'chrome.app' ein Submodul, das nicht vorhanden ist)
-["chrome.app", "chrome.csi", "chrome.loadTimes"].forEach((e) =>
-  stealth.enabledEvasions.delete(e)
-);
+// Sämtliche Evasions, die mit "chrome." beginnen, deaktivieren
+for (const name of Array.from(stealth.enabledEvasions.keys())) {
+  if (name.startsWith("chrome.")) {
+    stealth.enabledEvasions.delete(name);
+  }
+}
+
+// (Optional) weitere Evasions gezielt abschalten, falls nötig
+// stealth.enabledEvasions.delete("iframe.contentWindow");
+// stealth.enabledEvasions.delete("media.codecs");
+
 puppeteer.use(stealth);
+
 
 // ------------------------------------------------------------------------------
 
