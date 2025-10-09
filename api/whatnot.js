@@ -1,13 +1,12 @@
 // Node.js Serverless Function (Hobby-Plan: keine Multi-Region)
 export const config = {
   runtime: "nodejs"
-  // regions: ["fra1"] // optional: eine einzelne Region wäre erlaubt
+  // regions: ["fra1"] // optional: eine einzelne Region erlaubt
 };
 
 import chromium from "@sparticuz/chromium";
 import puppeteer from "puppeteer-core";
 
-// Ersatz für page.waitForTimeout (in neueren Puppeteer-Versionen nicht vorhanden)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export default async function handler(req, res) {
@@ -39,35 +38,63 @@ export default async function handler(req, res) {
     page.setDefaultNavigationTimeout(60000);
     page.setDefaultTimeout(30000);
 
+    // möglichst realistische Header
     await page.setExtraHTTPHeaders({
-      "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"
+      "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-User": "?1",
+      "Sec-Fetch-Dest": "document",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
     });
 
+    // „echter“ User-Agent
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
     );
 
-    // Vorsichtiges Laden – networkidle0 kann in Serverless hängen
+    // Seite laden
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-    // 1) Scroll triggert Lazy-Loading
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    // --- Anti-Bot-Interstitital abwarten / überspringen ---
+    const isInterstitialTitle = (t) =>
+      /nur einen moment|just a moment/i.test(t || "");
+
+    // bis zu 2 Versuche (erste Seite + 1 Reload)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // bis zu 12 s warten, bis der Titel NICHT mehr "Nur einen Moment…" ist
+      let ok = false;
+      for (let i = 0; i < 12; i++) {
+        const title = await page.title().catch(() => "");
+        if (!isInterstitialTitle(title)) {
+          ok = true;
+          break;
+        }
+        await sleep(1000);
+      }
+      if (ok) break;
+
+      // wenn immer noch Interstitital → noch einmal neu laden
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await sleep(1500);
+    }
+
+    // leichter Scroll (lazy load)
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
     await sleep(800);
 
-    // 2) Auf (mögliche) Live-Links warten; wenn keine kommen, still weiter
+    // auf mögliche Live-Links warten (still weiter, wenn nicht)
     await page
       .waitForSelector('a[href^="/live/"], a[href*="/live/"]', { timeout: 12000 })
       .catch(() => {});
 
-    // 3) Kurzer Netzwerk-Idle (falls verfügbar)
-    try {
-      await page.waitForNetworkIdle({ idleTime: 750, timeout: 8000 });
-    } catch (_) {}
+    // (falls möglich) kurzen Idle abwarten
+    try { await page.waitForNetworkIdle({ idleTime: 750, timeout: 8000 }); } catch {}
 
-    // 4) Noch 0,5s für Bilder/Alt-Texte
     await sleep(500);
 
-    // Debug-Infos in die Function-Logs
+    // Debug-Infos loggen
     const info = await page.evaluate(() => ({
       title: document.title,
       anchorCount: document.querySelectorAll('a[href^="/live/"], a[href*="/live/"]').length,
@@ -75,7 +102,7 @@ export default async function handler(req, res) {
     }));
     console.log("whatnot page info:", info);
 
-    // 5) (optional) Next.js Initialdaten lesen
+    // Next.js-Daten optional holen
     await page.waitForSelector("#__NEXT_DATA__", { timeout: 5000 }).catch(() => {});
     const nextData = await page.evaluate(() => {
       try {
@@ -104,7 +131,6 @@ export default async function handler(req, res) {
       keys.find((k) => o && typeof o[k] === "string" && o[k]) &&
       o[keys.find((k) => o && typeof o[k] === "string" && o[k])];
 
-    // 5a) Versuch über __NEXT_DATA__
     if (nextData) {
       const seen = new Set();
       walk(nextData, (k, v) => {
@@ -122,14 +148,16 @@ export default async function handler(req, res) {
                 : `https://www.whatnot.com${raw.startsWith("/") ? "" : "/"}${raw}`;
             }
 
-            if (fullUrl && /https?:\/\/www\.whatnot\.com\/live\//.test(fullUrl) && !seen.has(fullUrl)) {
-              seen.add(fullUrl);
-              shows.push({
-                title: title || "Whatnot Show",
-                url: fullUrl,
-                image: image || null,
-                start_at: start_at || null
-              });
+            if (fullUrl && /https?:\/\/www\.whatnot\.com\/live\//.test(fullUrl)) {
+              if (!seen.has(fullUrl)) {
+                seen.add(fullUrl);
+                shows.push({
+                  title: title || "Whatnot Show",
+                  url: fullUrl,
+                  image: image || null,
+                  start_at: start_at || null
+                });
+              }
             }
           }
         }
@@ -142,7 +170,6 @@ export default async function handler(req, res) {
       );
     }
 
-    // 5b) Fallback: DOM scannen
     if (!shows.length) {
       const domShows = await page.evaluate(() => {
         const results = [];
